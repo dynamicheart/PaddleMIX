@@ -28,6 +28,12 @@ import paddle.nn as nn
 import paddle.nn.functional as F
 from paddlenlp.transformers.model_outputs import BaseModelOutputWithPast, ModelOutput
 from paddlenlp.transformers.model_utils import PretrainedModel
+import paddlenlp.transformers.linear_utils as linear_utils
+from paddlenlp.utils.tools import get_env_device
+if get_env_device() == "xpu":
+    from paddle_xpu.layers.nn.linear import xpu_matmul
+else:
+    xpu_matmul = None
 
 from paddlemix.models.flash_attn_utils import (
     create_attention_module,
@@ -45,6 +51,12 @@ logger = logging.get_logger(__name__)
 flash_attn_func, flash_attn_varlen_func = has_flash_attn_func()
 _IS_NPU = "npu" in paddle.get_device()
 
+
+def matmul(*args, **kwargs):
+    if get_env_device() == "xpu":
+        return xpu_matmul()(*args, **kwargs)
+    else:
+        return paddle.matmul(*args, **kwargs)
 
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(axis=-1, dtype="int32")
@@ -286,9 +298,9 @@ class PatchMerger(nn.Layer):
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.ln_q = nn.LayerNorm(context_dim, epsilon=1e-6)
         self.mlp = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size),
+            linear_utils.Linear(self.hidden_size, self.hidden_size),
             nn.GELU(),
-            nn.Linear(self.hidden_size, dim),
+            linear_utils.Linear(self.hidden_size, dim),
         )
 
     def forward(self, x: paddle.Tensor) -> paddle.Tensor:
@@ -299,9 +311,9 @@ class PatchMerger(nn.Layer):
 class VisionMlp(nn.Layer):
     def __init__(self, dim: int, hidden_dim: int, hidden_act: str) -> None:
         super().__init__()
-        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.fc1 = linear_utils.Linear(dim, hidden_dim)
         self.act = ACT2FN[hidden_act]
-        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.fc2 = linear_utils.Linear(hidden_dim, dim)
 
     def forward(self, x) -> paddle.Tensor:
         return self.fc2(self.act(self.fc1(x)))
@@ -311,8 +323,8 @@ class VisionAttention(nn.Layer):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias_attr=True)
-        self.proj = nn.Linear(dim, dim)
+        self.qkv = linear_utils.Linear(dim, dim * 3, bias_attr=True)
+        self.proj = linear_utils.Linear(dim, dim)
         self.head_dim = dim // num_heads  # must added
 
     def forward(
@@ -336,10 +348,10 @@ class VisionAttention(nn.Layer):
         q = q.transpose([1, 0, 2])
         k = k.transpose([1, 0, 2])
         v = v.transpose([1, 0, 2])
-        attn_weights = paddle.matmul(q, k.transpose([0, 2, 1])) / math.sqrt(self.head_dim)
+        attn_weights = matmul(q, k.transpose([0, 2, 1])) / math.sqrt(self.head_dim)
         attn_weights = attn_weights + attention_mask
         attn_weights = nn.functional.softmax(attn_weights, axis=-1, dtype="float32")
-        attn_output = paddle.matmul(attn_weights, v)
+        attn_output = matmul(attn_weights, v)
         attn_output = attn_output.transpose([1, 0, 2])
         attn_output = attn_output.reshape([seq_length, -1])
         attn_output = self.proj(attn_output)
@@ -350,8 +362,8 @@ class VisionFlashAttention2(nn.Layer):
     def __init__(self, dim: int, num_heads: int = 16) -> None:
         super().__init__()
         self.num_heads = num_heads
-        self.qkv = nn.Linear(dim, dim * 3, bias_attr=True)
-        self.proj = nn.Linear(dim, dim)
+        self.qkv = linear_utils.Linear(dim, dim * 3, bias_attr=True)
+        self.proj = linear_utils.Linear(dim, dim)
         self.head_dim = dim // num_heads  # must added
 
     def forward(
@@ -498,9 +510,9 @@ class Qwen2MLP(nn.Layer):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias_attr=False)
+        self.gate_proj = linear_utils.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
+        self.up_proj = linear_utils.Linear(self.hidden_size, self.intermediate_size, bias_attr=False)
+        self.down_proj = linear_utils.Linear(self.intermediate_size, self.hidden_size, bias_attr=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_state):
@@ -553,10 +565,10 @@ class Qwen2VLAttention(nn.Layer):
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias_attr=True)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias_attr=True)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias_attr=True)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias_attr=False)
+        self.q_proj = linear_utils.Linear(self.hidden_size, self.num_heads * self.head_dim, bias_attr=True)
+        self.k_proj = linear_utils.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias_attr=True)
+        self.v_proj = linear_utils.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias_attr=True)
+        self.o_proj = linear_utils.Linear(self.num_heads * self.head_dim, self.hidden_size, bias_attr=False)
 
         self.rotary_emb = Qwen2RotaryEmbedding(
             self.head_dim,
@@ -617,13 +629,13 @@ class Qwen2VLAttention(nn.Layer):
         key_states = key_states.astype("float32")
         value_states = value_states.astype("float32")
 
-        attn_weights = paddle.matmul(query_states, key_states.transpose([0, 1, 3, 2])) / math.sqrt(self.head_dim)
+        attn_weights = matmul(query_states, key_states.transpose([0, 1, 3, 2])) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
             attn_weights = attn_weights + attention_mask
         attn_weights = nn.functional.softmax(attn_weights, axis=-1, dtype="float32")
         attn_weights = nn.functional.dropout(x=attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = paddle.matmul(attn_weights.cast(self.config.dtype), value_states.cast(self.config.dtype))
+        attn_output = matmul(attn_weights.cast(self.config.dtype), value_states.cast(self.config.dtype))
 
         if attn_output.shape != [bsz, self.num_heads, q_len, self.head_dim]:
             raise ValueError(
@@ -942,7 +954,7 @@ class Qwen2VLPreTrainedModel(PretrainedModel):
 
     def _init_weights(self, layer):
         std = 0.2
-        if isinstance(layer, (nn.Linear, nn.Conv3D)):
+        if isinstance(layer, (linear_utils.Linear, nn.Conv3D)):
             nn.initializer.Normal(mean=0.0, std=std)(layer.weight)
             if layer.bias is not None:
                 nn.initializer.Constant(0.0)(layer.bias)
@@ -1212,8 +1224,16 @@ class Qwen2LMHead(nn.Layer):
                 dtype=paddle.get_default_dtype(),
             )
 
+        if get_env_device() == "xpu":
+            self.matmul = xpu_matmul()
+        else:
+            self.matmul = None
+
     def forward(self, hidden_states):
-        logits = paddle.matmul(hidden_states, self.weight, transpose_y=self.transpose_y)
+        if get_env_device() == "xpu":
+            logits = self.matmul(hidden_states, self.weight, transpose_y=self.transpose_y, training=self.training)
+        else:
+            logits = paddle.matmul(hidden_states, self.weight, transpose_y=self.transpose_y)
         return logits
 
 
